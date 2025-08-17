@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# instala-formio.sh — Form.io CE + MongoDB (local) + Nginx (Ubuntu 22.04/24.04)
+# instala-formio.sh — Form.io CE (imagen comunitaria) + MongoDB + Nginx (Ubuntu 22.04/24.04)
 # Uso:
-#   ./instala-formio.sh formio.urmah.ai
-#   ./instala-formio.sh formio.urmah.ai --cert /etc/ssl/certificados/fullchain.pem --key /etc/ssl/certificados/privkey.pem \
-#       --allow-origins "https://formio.urmah.ai,https://cliente1.com" \
-#       --admin-email "admin@example.com" --admin-pass "CHANGEME"
+#   ./instala-formio.sh formio.ejemplo.com
+#   ./instala-formio.sh formio.ejemplo.com --cert /etc/ssl/certs/fullchain.pem --key /etc/ssl/private/privkey.pem \
+#       --allow-origins "https://formio.ejemplo.com,https://cliente.com" \
+#       --admin-email "admin@example.com" --admin-pass "CHANGEME" \
+#       --image calipseo/formio:1.87.0
+#
+# Idempotente: puede ejecutarse múltiples veces; rehace configs y recarga servicios sin romper estado de datos.
 
 set -euo pipefail
 shopt -s nocasematch
 
 log(){ printf "\n==== %s ====\n" "$*"; }
-need(){ command -v "$1" >/dev/null 2>&1; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1; }
 port_busy(){ ss -ltnp 2>/dev/null | grep -qE "[\.:]${1}\s"; }
 
 # --- sudo automático ---
@@ -19,16 +22,20 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then exec sudo -E bash "$0" "$@"; fi
 
 # --- args ---
 if [[ $# -lt 1 ]]; then
-  echo "Uso: $0 <dominio> [--cert <fullchain.pem>] [--key <privkey.pem>] [--allow-origins <CSV>] [--admin-email <email>] [--admin-pass <pass>]"
+  echo "Uso: $0 <dominio> [--cert <fullchain.pem>] [--key <privkey.pem>] [--allow-origins <CSV>] [--admin-email <email>] [--admin-pass <pass>] [--image <img:tag>]"
   exit 1
 fi
 DOMAIN="$1"; shift || true
+
+# Defaults
 CERT_PATH="/etc/ssl/certificados/fullchain.pem"
 KEY_PATH="/etc/ssl/certificados/privkey.pem"
 ALLOW_ORIGINS="https://${DOMAIN}"
 ADMIN_EMAIL="admin@example.com"
 ADMIN_PASS="CHANGEME"
+FORMIO_IMAGE="calipseo/formio:1.87.0"
 
+# Parse flags
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --cert) CERT_PATH="${2:-}"; shift 2;;
@@ -36,21 +43,22 @@ while [[ $# -gt 0 ]]; do
     --allow-origins) ALLOW_ORIGINS="${2:-}"; shift 2;;
     --admin-email) ADMIN_EMAIL="${2:-}"; shift 2;;
     --admin-pass)  ADMIN_PASS="${2:-}"; shift 2;;
+    --image)       FORMIO_IMAGE="${2:-}"; shift 2;;
     *) die "Opción desconocida: $1";;
-  esac
+  endcase
 done
 
 RUN_USER="${SUDO_USER:-$USER}"
 INSTALL_DIR="/opt/formio"
 MONGO_DATA="/var/lib/formio/mongo"
-SITE_CONF="/etc/nginx/sites-available/formio-${DOMAIN}.conf"
-SITE_LINK="/etc/nginx/sites-enabled/formio-${DOMAIN}.conf"
 FORMIO_PORT="3001"
 CLIENT_MAX_BODY="50m"
+SITE_CONF="/etc/nginx/sites-available/formio-${DOMAIN}.conf"
+SITE_LINK="/etc/nginx/sites-enabled/formio-${DOMAIN}.conf"
 
 log "1/8 Prerrequisitos"
 apt-get update -y >/dev/null 2>&1 || true
-apt-get install -y ca-certificates curl gnupg lsb-release nginx git >/dev/null 2>&1
+apt-get install -y ca-certificates curl gnupg lsb-release nginx git >/dev/null 2>&1 || true
 if ! need docker; then
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -65,7 +73,8 @@ groupadd docker 2>/dev/null || true
 usermod -aG docker "${RUN_USER}" || true
 
 log "2/8 Certificados SSL"
-[[ -f "$CERT_PATH" && -f "$KEY_PATH" ]] || die "No se encuentran los certificados en ${CERT_PATH} y ${KEY_PATH}"
+[[ -f "$CERT_PATH" && -f "$KEY_PATH" ]] || die "No se encuentran los certificados en ${CERT_PATH} y/o ${KEY_PATH}"
+# limpiar CRLF/espacios
 sed -i -e 's/\r$//' -e 's/[ \t]*$//' "$CERT_PATH" "$KEY_PATH" || true
 chmod 600 "$KEY_PATH"; chmod 644 "$CERT_PATH"; chown root:root "$KEY_PATH" "$CERT_PATH" || true
 openssl x509 -noout -in "$CERT_PATH" >/dev/null 2>&1 || die "Certificado inválido"
@@ -77,8 +86,8 @@ chown -R "${RUN_USER}:${RUN_USER}" "${INSTALL_DIR}" || true
 log "4/8 Docker Compose (Form.io CE + MongoDB RS)"
 cd "${INSTALL_DIR}"
 
-# compose base (sin 'version:' para evitar warning)
-cat > docker-compose.yml <<'YAML'
+# docker-compose.yml (base)
+tee docker-compose.yml >/dev/null <<YAML
 services:
   mongo:
     image: mongo:6
@@ -93,29 +102,15 @@ services:
       retries: 60
 
   formio:
-    image: node:20-bookworm
+    image: ${FORMIO_IMAGE}
     restart: unless-stopped
-    working_dir: /srv/formio/server
     depends_on:
       mongo:
         condition: service_healthy
     environment:
       PORT: "3001"
-    # Debian + toolchain para módulos nativos
-    command: >
-      bash -lc "
-        apt-get update &&
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
-          git python3 build-essential pkg-config ca-certificates openssl &&
-        npm i -g npm@latest @formio/cli@latest &&
-        test -d /srv/formio/server || git clone --depth=1 https://github.com/formio/formio.git /srv/formio/server &&
-        npm ci --no-audit --no-fund || npm i &&
-        npm run bootstrap &&
-        npm run services &&
-        node server.js
-      "
     healthcheck:
-      test: ["CMD-SHELL","curl -sf http://127.0.0.1:3001/health || wget -q -O- http://127.0.0.1:3001/health"]
+      test: ["CMD-SHELL","curl -sf http://127.0.0.1:3001/ || wget -q -O- http://127.0.0.1:3001/"]
       interval: 15s
       timeout: 5s
       retries: 60
@@ -124,20 +119,22 @@ volumes:
   mongo-data:
 YAML
 
-# override: puerto + variables
-cat > docker-compose.override.yml <<YAML
+# docker-compose.override.yml (vars, puerto)
+tee docker-compose.override.yml >/dev/null <<YAML
 services:
   formio:
     environment:
       MONGO: "mongodb://mongo:27017/formio?replicaSet=rs0"
-      ADMIN_EMAIL: "${ADMIN_EMAIL}"
-      ADMIN_PASSWORD: "${ADMIN_PASS}"
+      ROOT_EMAIL: "${ADMIN_EMAIL}"
+      ROOT_PASSWORD: "${ADMIN_PASS}"
       PORTAL_ENABLED: "true"
+      API_URL: "https://${DOMAIN}"
+      APP_URL: "https://${DOMAIN}"
     ports:
       - "127.0.0.1:${FORMIO_PORT}:3001"
 YAML
 
-# liberar puerto si estuviera tomado
+# liberar puerto si estuviera ocupado
 if port_busy "${FORMIO_PORT}"; then
   docker ps --format '{{.ID}} {{.Ports}}' | awk -v p=":${FORMIO_PORT}->" '$0 ~ p {print $1}' | xargs -r docker stop >/dev/null 2>&1 || true
   sleep 1
@@ -157,11 +154,12 @@ try { rs.status().ok } catch (e) { rs.initiate({_id:"rs0", members:[{_id:0, host
 JS
 
 log "6/8 Nginx (reverse proxy + SSL + CORS + WebSockets)"
+# Construir regex para orígenes permitidos (CORS)
 ALLOWED_REGEX="^$(echo "$ALLOW_ORIGINS" | sed 's/[[:space:]]//g' | tr ',' '\n' | sed -E 's/([][().^$*+?{}|\\])/\\\1/g' | sed 's/^/^/; s/$/$/;' | paste -sd'|' - )$"
 [[ -z "${ALLOWED_REGEX}" ]] && ALLOWED_REGEX="^https://$(echo "$DOMAIN" | sed 's/[][^.$\\*+?{}()|]/\\&/g')$"
 
-cat > "${SITE_CONF}" <<NGINX
-# 'map' en contexto http (este archivo se incluye dentro de 'http')
+tee "${SITE_CONF}" >/dev/null <<NGINX
+# Este archivo se incluye dentro del contexto 'http' de nginx.conf, por eso 'map' es válido aquí.
 map \$http_origin \$cors_allow {
     default "";
     ~${ALLOWED_REGEX} \$http_origin;
@@ -187,7 +185,7 @@ server {
   add_header Referrer-Policy strict-origin-when-cross-origin;
   client_max_body_size ${CLIENT_MAX_BODY};
 
-  # CORS (sin 'if': Nginx omite header si el valor es cadena vacía)
+  # CORS (si \$cors_allow es "", Nginx no envía el header)
   set \$cors_methods "GET, POST, PUT, PATCH, DELETE, OPTIONS";
   set \$cors_headers "DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization";
   add_header Access-Control-Allow-Origin \$cors_allow always;
@@ -197,8 +195,8 @@ server {
   add_header Access-Control-Allow-Headers \$cors_headers always;
   add_header Access-Control-Expose-Headers "Content-Length,Content-Range" always;
 
-  # Preflight
   location / {
+    # Preflight
     if (\$request_method = OPTIONS) {
       add_header Content-Length 0;
       add_header Content-Type text/plain;
@@ -214,6 +212,8 @@ server {
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header Upgrade \$http_upgrade;
     proxy_set_header Connection "upgrade";
+    proxy_connect_timeout 30s;
+    proxy_send_timeout 300s;
     proxy_read_timeout 300s;
   }
 }
@@ -224,10 +224,10 @@ rm -f /etc/nginx/sites-enabled/default || true
 nginx -t || die "nginx -t falló"
 systemctl reload nginx || die "reload nginx falló"
 
-log "7/8 Esperando salud del servicio (hasta 3 min)"
+log "7/8 Esperando salud (hasta 3 min)"
 OK=0
 for _ in $(seq 1 90); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${FORMIO_PORT}/health" || true)
+  code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${FORMIO_PORT}/" || true)
   if [[ "$code" -ge 200 && "$code" -lt 500 ]]; then OK=1; break; fi
   sleep 2
 done
@@ -237,6 +237,6 @@ echo "URL:   https://${DOMAIN}"
 echo "Nginx: ${SITE_CONF}"
 echo "Dir:   ${INSTALL_DIR}"
 echo
-echo "Admin inicial (primer arranque):"
+echo "Root inicial:"
 echo "  ${ADMIN_EMAIL} / ${ADMIN_PASS}"
-[[ "$OK" -eq 1 ]] || echo "NOTA: aún inicializando; revisa: docker logs -f \$(docker compose ps -q formio)"
+[[ "$OK" -eq 1 ]] || echo "NOTA: el API aún inicializa; revisa: docker logs -f \$(docker compose ps -q formio)"
