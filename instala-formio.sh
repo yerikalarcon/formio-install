@@ -45,7 +45,7 @@ while [[ $# -gt 0 ]]; do
     --admin-pass)  ADMIN_PASS="${2:-}"; shift 2;;
     --image)       FORMIO_IMAGE="${2:-}"; shift 2;;
     *) die "Opción desconocida: $1";;
-  endcase
+  esac
 done
 
 RUN_USER="${SUDO_USER:-$USER}"
