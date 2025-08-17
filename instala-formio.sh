@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# instala-formio.sh — Form.io CE + MongoDB (ReplicaSet) + Nginx (Ubuntu 22.04/24.04)
+# instala-formio.sh — Form.io CE + MongoDB (local) + Nginx (Ubuntu 22.04/24.04)
 # Uso:
 #   ./instala-formio.sh formio.urmah.ai
 #   ./instala-formio.sh formio.urmah.ai --cert /etc/ssl/certificados/fullchain.pem --key /etc/ssl/certificados/privkey.pem \
-#       --allow-origins "https://formio.urmah.ai,https://yerik.org" \
-#       --admin-email "admin@urmah.ai" --admin-pass "PON_UN_PASS_SEGURO"
+#       --allow-origins "https://formio.urmah.ai,https://cliente1.com" \
+#       --admin-email "admin@example.com" --admin-pass "CHANGEME"
 
 set -euo pipefail
 shopt -s nocasematch
 
 log(){ printf "\n==== %s ====\n" "$*"; }
-need(){ command -v "$1" >/devnull 2>&1; }
+need(){ command -v "$1" >/dev/null 2>&1; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 port_busy(){ ss -ltnp 2>/dev/null | grep -qE "[\.:]${1}\s"; }
 
@@ -26,8 +26,8 @@ DOMAIN="$1"; shift || true
 CERT_PATH="/etc/ssl/certificados/fullchain.pem"
 KEY_PATH="/etc/ssl/certificados/privkey.pem"
 ALLOW_ORIGINS="https://${DOMAIN}"
-ADMIN_EMAIL="admin@urmah.ai"
-ADMIN_PASS="PON_UN_PASS_SEGURO"
+ADMIN_EMAIL="admin@example.com"
+ADMIN_PASS="CHANGEME"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -45,8 +45,7 @@ INSTALL_DIR="/opt/formio"
 MONGO_DATA="/var/lib/formio/mongo"
 SITE_CONF="/etc/nginx/sites-available/formio-${DOMAIN}.conf"
 SITE_LINK="/etc/nginx/sites-enabled/formio-${DOMAIN}.conf"
-HOST_UPSTREAM_PORT="3001"     # Nginx → host:127.0.0.1:3001
-CONTAINER_PORT="3000"         # Form.io dentro del contenedor
+FORMIO_PORT="3001"
 CLIENT_MAX_BODY="50m"
 
 log "1/8 Prerrequisitos"
@@ -96,73 +95,59 @@ services:
   formio:
     image: node:20-bookworm
     restart: unless-stopped
+    working_dir: /srv/formio/server
     depends_on:
       mongo:
         condition: service_healthy
-    # Healthcheck puro con Node (evita depender de curl/wget)
+    environment:
+      PORT: "3001"
+    # Debian + toolchain para módulos nativos
+    command: >
+      bash -lc "
+        apt-get update &&
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
+          git python3 build-essential pkg-config ca-certificates openssl &&
+        npm i -g npm@latest @formio/cli@latest &&
+        test -d /srv/formio/server || git clone --depth=1 https://github.com/formio/formio.git /srv/formio/server &&
+        npm ci --no-audit --no-fund || npm i &&
+        npm run bootstrap &&
+        npm run services &&
+        node server.js
+      "
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "node -e \"require('http').get({host:'127.0.0.1',port:3000,path:'/'},r=>process.exit(0)).on('error',()=>process.exit(1))\""
-        ]
+      test: ["CMD-SHELL","curl -sf http://127.0.0.1:3001/health || wget -q -O- http://127.0.0.1:3001/health"]
       interval: 15s
       timeout: 5s
       retries: 60
+
 volumes:
   mongo-data:
 YAML
 
-# override: entorno, puertos y comando de arranque robusto
+# override: puerto + variables
 cat > docker-compose.override.yml <<YAML
 services:
   formio:
     environment:
-      NODE_OPTIONS: "--max-old-space-size=8192"
-      PORTAL_ENABLED: "true"
-      PORT: "${CONTAINER_PORT}"
-      # Fuerza a ignorar config/default.json y usar Mongo RS en 'mongo'
-      NODE_CONFIG: '{"mongo":"mongodb://mongo:27017/formio?replicaSet=rs0"}'
-      # Se usan solo en primer arranque si no existe admin
+      MONGO: "mongodb://mongo:27017/formio?replicaSet=rs0"
       ADMIN_EMAIL: "${ADMIN_EMAIL}"
       ADMIN_PASSWORD: "${ADMIN_PASS}"
+      PORTAL_ENABLED: "true"
     ports:
-      - "127.0.0.1:${HOST_UPSTREAM_PORT}:${CONTAINER_PORT}"
-    command: >
-      bash -lc "
-        set -e
-        # Dependencias para módulos nativos y build del portal
-        apt-get update -y &&
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
-          git python3 build-essential pkg-config ca-certificates openssl > /dev/null
-        # Código Form.io
-        if [ ! -d /srv/formio/server ]; then
-          mkdir -p /srv/formio
-          git clone --depth=1 https://github.com/formio/formio.git /srv/formio/server
-        fi
-        cd /srv/formio/server
-        # Instala deps y construye el portal
-        npm install --no-audit --no-fund
-        npm run build:portal
-        # Pre-siembra no interactiva de la plantilla por stdin (idempotente)
-        printf '/srv/formio/server/default-template.json\n' | node --no-node-snapshot main.js || true
-        # Arranque normal
-        npm start
-      "
+      - "127.0.0.1:${FORMIO_PORT}:3001"
 YAML
 
 # liberar puerto si estuviera tomado
-if port_busy "${HOST_UPSTREAM_PORT}"; then
-  docker ps --format '{{.ID}} {{.Ports}}' | awk -v p=":${HOST_UPSTREAM_PORT}->" '$0 ~ p {print $1}' | xargs -r docker stop >/dev/null 2>&1 || true
+if port_busy "${FORMIO_PORT}"; then
+  docker ps --format '{{.ID}} {{.Ports}}' | awk -v p=":${FORMIO_PORT}->" '$0 ~ p {print $1}' | xargs -r docker stop >/dev/null 2>&1 || true
   sleep 1
 fi
-port_busy "${HOST_UPSTREAM_PORT}" && die "Puerto ${HOST_UPSTREAM_PORT} ocupado"
+port_busy "${FORMIO_PORT}" && die "Puerto ${FORMIO_PORT} ocupado"
 
 # levantar
 docker compose up -d || die "Fallo al levantar docker compose"
 
 log "5/8 Inicializar Replica Set de Mongo (rs0)"
-# esperar ping y luego iniciar RS si falta
 for _ in $(seq 1 60); do
   docker compose exec -T mongo mongosh --quiet --eval "db.adminCommand('ping').ok" >/dev/null 2>&1 && break
   sleep 2
@@ -176,6 +161,7 @@ ALLOWED_REGEX="^$(echo "$ALLOW_ORIGINS" | sed 's/[[:space:]]//g' | tr ',' '\n' |
 [[ -z "${ALLOWED_REGEX}" ]] && ALLOWED_REGEX="^https://$(echo "$DOMAIN" | sed 's/[][^.$\\*+?{}()|]/\\&/g')$"
 
 cat > "${SITE_CONF}" <<NGINX
+# 'map' en contexto http (este archivo se incluye dentro de 'http')
 map \$http_origin \$cors_allow {
     default "";
     ~${ALLOWED_REGEX} \$http_origin;
@@ -201,24 +187,25 @@ server {
   add_header Referrer-Policy strict-origin-when-cross-origin;
   client_max_body_size ${CLIENT_MAX_BODY};
 
-  # CORS (solo si el Origin coincide)
-  if (\$cors_allow != "") {
-    add_header Access-Control-Allow-Origin \$cors_allow always;
-    add_header Vary Origin always;
-    add_header Access-Control-Allow-Credentials true always;
-    add_header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS" always;
-    add_header Access-Control-Allow-Headers "DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization" always;
-    add_header Access-Control-Expose-Headers "Content-Length,Content-Range" always;
-  }
+  # CORS (sin 'if': Nginx omite header si el valor es cadena vacía)
+  set \$cors_methods "GET, POST, PUT, PATCH, DELETE, OPTIONS";
+  set \$cors_headers "DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization";
+  add_header Access-Control-Allow-Origin \$cors_allow always;
+  add_header Vary Origin always;
+  add_header Access-Control-Allow-Credentials true always;
+  add_header Access-Control-Allow-Methods \$cors_methods always;
+  add_header Access-Control-Allow-Headers \$cors_headers always;
+  add_header Access-Control-Expose-Headers "Content-Length,Content-Range" always;
 
-  if (\$request_method = OPTIONS) {
-    add_header Content-Length 0;
-    add_header Content-Type text/plain;
-    return 204;
-  }
-
+  # Preflight
   location / {
-    proxy_pass http://127.0.0.1:${HOST_UPSTREAM_PORT};
+    if (\$request_method = OPTIONS) {
+      add_header Content-Length 0;
+      add_header Content-Type text/plain;
+      return 204;
+    }
+
+    proxy_pass http://127.0.0.1:${FORMIO_PORT};
     proxy_http_version 1.1;
     proxy_set_header Host \$host;
     proxy_set_header X-Forwarded-Host \$host;
@@ -240,7 +227,7 @@ systemctl reload nginx || die "reload nginx falló"
 log "7/8 Esperando salud del servicio (hasta 3 min)"
 OK=0
 for _ in $(seq 1 90); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${HOST_UPSTREAM_PORT}/" || true)
+  code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${FORMIO_PORT}/health" || true)
   if [[ "$code" -ge 200 && "$code" -lt 500 ]]; then OK=1; break; fi
   sleep 2
 done
