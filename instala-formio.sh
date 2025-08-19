@@ -96,7 +96,7 @@ services:
     volumes:
       - mongo-data:/data/db
     healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      test: ["CMD", "mongosh", "--quiet", "db.adminCommand('ping').ok"]
       interval: 10s
       timeout: 5s
       retries: 60
@@ -154,9 +154,18 @@ try { rs.status().ok } catch (e) { rs.initiate({_id:"rs0", members:[{_id:0, host
 JS
 
 log "6/8 Nginx (reverse proxy + SSL + CORS + WebSockets)"
-# Construir regex para orígenes permitidos (CORS)
-ALLOWED_REGEX="^$(echo "$ALLOW_ORIGINS" | sed 's/[[:space:]]//g' | tr ',' '\n' | sed -E 's/([][().^$*+?{}|\\])/\\\1/g' | sed 's/^/^/; s/$/$/;' | paste -sd'|' - )$"
-[[ -z "${ALLOWED_REGEX}" ]] && ALLOWED_REGEX="^https://$(echo "$DOMAIN" | sed 's/[][^.$\\*+?{}()|]/\\&/g')$"
+
+# --- Construir regex de orígenes permitidos (CORS) ---
+#   - Limpia espacios, separa por comas
+#   - Escapa caracteres regex
+#   - Une con '|'
+#   - Forma final: ^(https://foo.com|https://bar.com)$
+ORIG_LIST_RAW="$(echo "$ALLOW_ORIGINS" | tr ',' '\n' | sed 's/[[:space:]]//g' | sed '/^$/d')"
+ORIG_LIST_ESC="$(echo "$ORIG_LIST_RAW" | sed -E 's/([][().^$*+?{}|\\])/\\\1/g')"
+if [[ -z "${ORIG_LIST_ESC}" ]]; then
+  ORIG_LIST_ESC="https:\/\/${DOMAIN//./\\.}"
+fi
+ALLOWED_REGEX="^($(echo "$ORIG_LIST_ESC" | paste -sd'|' -))$"
 
 tee "${SITE_CONF}" >/dev/null <<NGINX
 # Este archivo se incluye dentro del contexto 'http' de nginx.conf, por eso 'map' es válido aquí.
@@ -180,41 +189,63 @@ server {
   ssl_certificate     ${CERT_PATH};
   ssl_certificate_key ${KEY_PATH};
 
+  # Seguridad básica
   add_header X-Frame-Options DENY;
   add_header X-Content-Type-Options nosniff;
   add_header Referrer-Policy strict-origin-when-cross-origin;
+
   client_max_body_size ${CLIENT_MAX_BODY};
 
-  # CORS (si \$cors_allow es "", Nginx no envía el header)
+  # Variables para CORS
   set \$cors_methods "GET, POST, PUT, PATCH, DELETE, OPTIONS";
   set \$cors_headers "DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization";
-  add_header Access-Control-Allow-Origin \$cors_allow always;
-  add_header Vary Origin always;
-  add_header Access-Control-Allow-Credentials true always;
-  add_header Access-Control-Allow-Methods \$cors_methods always;
-  add_header Access-Control-Allow-Headers \$cors_headers always;
-  add_header Access-Control-Expose-Headers "Content-Length,Content-Range" always;
 
   location / {
-    # Preflight
+    # ---- Preflight ----
     if (\$request_method = OPTIONS) {
-      add_header Content-Length 0;
+      # CORS (repetidos aquí porque hay add_header en este location)
+      add_header Access-Control-Allow-Origin   \$cors_allow always;
+      add_header Access-Control-Allow-Credentials true always;
+      add_header Access-Control-Allow-Methods  \$cors_methods always;
+      add_header Access-Control-Allow-Headers  \$cors_headers always;
+      add_header Access-Control-Expose-Headers "Content-Length,Content-Range" always;
+      add_header Vary Origin always;
+
       add_header Content-Type text/plain;
       return 204;
     }
 
+    # ---- Proxy a la API de Form.io ----
     proxy_pass http://127.0.0.1:${FORMIO_PORT};
     proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Forwarded-Host \$host;
+
+    proxy_set_header Host              \$host;
+    proxy_set_header X-Forwarded-Host  \$host;
     proxy_set_header X-Forwarded-Proto \$scheme;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection "upgrade";
+    proxy_set_header X-Real-IP         \$remote_addr;
+    proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+
+    proxy_set_header Upgrade           \$http_upgrade;
+    proxy_set_header Connection        "upgrade";
+
     proxy_connect_timeout 30s;
-    proxy_send_timeout 300s;
-    proxy_read_timeout 300s;
+    proxy_send_timeout    300s;
+    proxy_read_timeout    300s;
+
+    # ---- CORS en respuestas normales ----
+    add_header Access-Control-Allow-Origin   \$cors_allow always;
+    add_header Access-Control-Allow-Credentials true always;
+    add_header Access-Control-Allow-Methods  \$cors_methods always;
+    add_header Access-Control-Allow-Headers  \$cors_headers always;
+    add_header Access-Control-Expose-Headers "Content-Length,Content-Range" always;
+    add_header Vary Origin always;
+
+    # ---- Evitar duplicados si el backend mete '*' ----
+    proxy_hide_header Access-Control-Allow-Origin;
+    proxy_hide_header Access-Control-Allow-Headers;
+    proxy_hide_header Access-Control-Allow-Methods;
+    proxy_hide_header Access-Control-Allow-Credentials;
+    proxy_hide_header Access-Control-Expose-Headers;
   }
 }
 NGINX
