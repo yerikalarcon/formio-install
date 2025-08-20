@@ -136,7 +136,7 @@ YAML
 
 # liberar puerto si estuviera ocupado
 if port_busy "${FORMIO_PORT}"; then
-  docker ps --format '{{.ID}} {{.Ports}}' | awk -v p=":${FORMIO_PORT}->" '$0 ~ p {print $1}' | xargs -r docker stop >/devnull 2>&1 || true
+  docker ps --format '{{.ID}} {{.Ports}}' | awk -v p=":${FORMIO_PORT}->" '$0 ~ p {print $1}' | xargs -r docker stop >/dev/null 2>&1 || true
   sleep 1
 fi
 port_busy "${FORMIO_PORT}" && die "Puerto ${FORMIO_PORT} ocupado"
@@ -156,9 +156,8 @@ JS
 log "6/8 Nginx (reverse proxy + SSL + CORS + WebSockets)"
 
 # --- Construir dinámicamente el bloque map para CORS desde --allow-origins ---
-# Normaliza CSV -> líneas, recorta, elimina vacíos y duplica https://${DOMAIN} si ya está
+# Normaliza CSV -> líneas, recorta, elimina vacíos y asegura https://${DOMAIN}
 TMP_ALLOWED="$(echo "$ALLOW_ORIGINS" | tr ',' '\n' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g' | sed '/^$/d' | sort -u)"
-# Asegura https://${DOMAIN} presente
 if ! echo "$TMP_ALLOWED" | grep -qx "https://${DOMAIN}"; then
   TMP_ALLOWED=$(printf '%s\n%s\n' "https://${DOMAIN}" "$TMP_ALLOWED" | sort -u)
 fi
@@ -168,14 +167,14 @@ while IFS= read -r ORI; do
   # Solo permitir https:// … (si alguien pasa http://, se ignora)
   if [[ "$ORI" =~ ^https:// ]]; then
     ESCAPED="$(printf '%s' "$ORI" | sed -E 's/([][().^$*+?{}|\\])/\\\1/g')"
-    CORS_MAP_LINES+="    \"~^${ESCAPED}\$\"        \$http_origin;\n"
+    CORS_MAP_LINES+=$(printf '    "~^%s$"        $http_origin;\n' "$ESCAPED")
   fi
 done <<< "$TMP_ALLOWED"
 
 # Si por algún motivo no hay líneas, al menos el propio dominio
 if [[ -z "$CORS_MAP_LINES" ]]; then
   ESCAPED="$(printf '%s' "https://${DOMAIN}" | sed -E 's/([][().^$*+?{}|\\])/\\\1/g')"
-  CORS_MAP_LINES+="    \"~^${ESCAPED}\$\"        \$http_origin;\n"
+  CORS_MAP_LINES+=$(printf '    "~^%s$"        $http_origin;\n' "$ESCAPED")
 fi
 
 # Plantilla de sitio Nginx (equivalente a la que confirmaste que funciona, pero parametrizada)
@@ -183,7 +182,7 @@ tee "${SITE_CONF}" >/dev/null <<NGINX
 # ---- CORS: permitir solo estos orígenes exactos ----
 map \$http_origin \$cors_allow {
     default "";
-${CORS_MAP_LINES%\\n}
+${CORS_MAP_LINES}
 }
 
 server {
